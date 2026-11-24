@@ -1,5 +1,7 @@
-import { chromium, request, type APIRequestContext, type Browser } from "playwright";
-import { existsSync, mkdirSync, chmodSync, rmSync } from "node:fs";
+import { chromium, request, type APIRequestContext, type Browser, type BrowserContext, type Page } from "playwright";
+import { existsSync, mkdirSync, chmodSync, rmSync, createWriteStream, renameSync, statSync } from "node:fs";
+import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -474,53 +476,51 @@ export class BlackboardSession {
     }
   }
 
-  /** Opens the course's Zoom LTI in a headless browser, goes to Cloud Recordings and downloads each recording into `destDir`. */
-  async downloadZoomRecordings(launchUrl: string, destDir: string): Promise<Array<{ topic: string; file?: string; skipped?: string }>> {
-    const { page, context, browser } = await this.zoomRecordingsPage(launchUrl);
-    mkdirSync(destDir, { recursive: true });
-    const results: Array<{ topic: string; file?: string; skipped?: string }> = [];
+  /**
+   * Downloads the course's Zoom Cloud Recordings into `destDir`, one at a time.
+   *
+   * The Zoom LTI does not expose a download button when the host disabled downloads, so each recording is
+   * resolved through the LTI's own JSON API: the list response gives the recordings, opening a recording's detail
+   * view gives its files and their `playUrl`, and the player page requests a signed media URL that is fetched
+   * with the session cookies. No element handle is kept across navigations: the list is reloaded and every
+   * element is re-located for each recording.
+   */
+  async downloadZoomRecordings(
+    launchUrl: string,
+    destDir: string,
+    opts: { filter?: ZoomRecordingFilter; fileType?: ZoomFileType } = {}
+  ): Promise<ZoomDownloadResult[]> {
+    const fileType = opts.fileType ?? "mp4";
+    const { page, context, browser } = await this.zoomRecordingsPage(launchUrl, { requireList: true });
+    const results: ZoomDownloadResult[] = [];
     try {
-      const rowHandles = await page.$$("table tbody tr");
-      for (let i = 0; i < rowHandles.length; i++) {
-        const tr = rowHandles[i];
-        const topic = ((await tr.$eval("td", (td) => (td as any).innerText).catch(() => "")) || `recording-${i}`).trim();
-        const safe = topic.replace(/[\\/:*?"<>|]+/g, "_").slice(0, 120);
-        // Try a download control inside the row first; otherwise open the recording detail page.
-        let downloadEl = await tr.$("a[href*='download'], button:has-text('Download'), [title*='ownload' i], [aria-label*='ownload' i]");
-        if (!downloadEl) {
-          const link = await tr.$("a[href]");
-          if (link) {
-            await link.click();
-            await page.waitForLoadState("domcontentloaded").catch(() => {});
-            await page.waitForTimeout(1500);
-            downloadEl = await page.$("a[href*='download'], button:has-text('Download'), [title*='ownload' i], [aria-label*='ownload' i]");
+      const all = this.lastZoomList ?? [];
+      const selected = all.map((rec, index) => ({ rec, index })).filter(({ rec }) => matchesZoomFilter(rec, opts.filter));
+      if (selected.length) mkdirSync(destDir, { recursive: true });
+      for (let n = 0; n < selected.length; n++) {
+        const { rec, index } = selected[n];
+        const base = zoomResultBase(rec);
+        try {
+          // The first recording uses the list already open; every later one starts from a fresh list.
+          if (n > 0) await this.openZoomRecordingList(page, launchUrl);
+          const files = await this.openZoomRecordingDetail(page, rec, index);
+          const wanted = files.find((f) => f.fileType?.toUpperCase() === fileType.toUpperCase() && f.playUrl);
+          if (!wanted) {
+            results.push({ ...base, skipped: `no playable ${fileType} file for this recording` });
+            continue;
           }
-        }
-        if (!downloadEl) {
-          results.push({ topic, skipped: "no download control found" });
-          await page.goBack().catch(() => {});
-          continue;
-        }
-        // Prefer intercepting the browser download event (covers both direct links and JS triggers).
-        const [download] = await Promise.all([
-          page.waitForEvent("download", { timeout: 30000 }).catch(() => null),
-          downloadEl.click().catch(() => null),
-        ]);
-        if (download) {
-          const name = `${safe}.mp4`;
-          await download.saveAs(join(destDir, name));
-          results.push({ topic, file: join(destDir, name) });
-        } else {
-          const href = await downloadEl.getAttribute("href");
-          if (href) {
-            const abs = new URL(href, page.url()).href;
-            const file = await this.downloadTo(destDir, abs, `${safe}.mp4`);
-            results.push({ topic, file });
-          } else {
-            results.push({ topic, skipped: "download triggered nothing" });
+          const name = `${base.date ?? "recording"} ${rec.topic ?? rec.meetingNumber ?? index}`.replace(/[\\/:*?"<>|]+/g, "_").slice(0, 140);
+          const file = join(destDir, `${name}.${fileType}`);
+          if (existsSync(file) && wanted.fileSize && statSync(file).size === wanted.fileSize) {
+            results.push({ ...base, file, bytes: wanted.fileSize, skipped: "already downloaded" });
+            continue;
           }
+          const mediaUrl = await this.resolveZoomMediaUrl(context, wanted.playUrl!, fileType);
+          const bytes = await this.streamWithCookies(context, mediaUrl, file);
+          results.push({ ...base, file, bytes });
+        } catch (e) {
+          results.push({ ...base, error: e instanceof Error ? e.message : String(e) });
         }
-        await page.goBack().catch(() => {});
       }
       return results;
     } finally {
@@ -529,29 +529,84 @@ export class BlackboardSession {
     }
   }
 
+  /** The recordings list from the last Cloud Recordings page load (the LTI's own JSON response). */
+  private lastZoomList: ZoomApiRecording[] | undefined;
+
   /** Launches the Zoom LTI inside the saved session and lands on the Cloud Recordings tab. */
-  private async zoomRecordingsPage(launchUrl: string) {
+  private async zoomRecordingsPage(launchUrl: string, opts: { requireList?: boolean } = {}) {
     if (!existsSync(STATE_FILE)) throw new NotLoggedInError();
     const browser = await chromium.launch({ channel: BROWSER_CHANNEL, headless: true });
     const context = await browser.newContext({ storageState: STATE_FILE });
     const page = await context.newPage();
+    try {
+      await this.openZoomRecordingList(page, launchUrl, opts.requireList ?? false);
+    } catch (e) {
+      await browser.close().catch(() => {});
+      throw e;
+    }
+    return { page, context, browser };
+  }
+
+  /** (Re)launches the LTI on `page`, opens Cloud Recordings and waits until the list has loaded. */
+  private async openZoomRecordingList(page: Page, launchUrl: string, requireList = true): Promise<void> {
+    const listResponse = page
+      .waitForResponse((r) => /\/lti\/rich\/recording\/COURSE\?/.test(r.url()) && r.ok(), { timeout: 90000 })
+      .catch(() => null);
     await page.goto(launchUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
     // LTI redirects through applications.zoom.us; give it time, then click the Cloud Recordings tab.
     await page.waitForURL(/zoom\.us|zoom\.com/, { timeout: 60000 }).catch(() => {});
     const tab = page.locator("text=/cloud recordings/i").first();
     await tab.waitFor({ timeout: 30000 }).catch(() => {});
     await tab.click().catch(() => {});
-    await page.waitForTimeout(2500);
-    return { page, context, browser };
+    const resp = await listResponse;
+    const body = resp ? await resp.json().catch(() => null) : null;
+    this.lastZoomList = body?.result?.list;
+    if (requireList && !Array.isArray(this.lastZoomList)) throw new Error("Zoom Cloud Recordings list did not load.");
+    // Let the table render the rows the response describes.
+    await page.locator("table tbody tr").first().waitFor({ timeout: 15000 }).catch(() => {});
   }
 
-  private async downloadTo(destDir: string, url: string, fileName: string): Promise<string> {
-    const resp = await this.api!.get(url);
-    if (!resp.ok()) throw new Error(`Download failed: HTTP ${resp.status()}`);
-    const file = join(destDir, fileName);
-    const { writeFile } = await import("node:fs/promises");
-    await writeFile(file, Buffer.from(await resp.body()));
-    return file;
+  /** Opens a recording's detail view from the list and returns its files (from the LTI's JSON response). */
+  private async openZoomRecordingDetail(page: Page, rec: ZoomApiRecording, index: number): Promise<ZoomApiFile[]> {
+    // Rows are keyed by their position in the list response; check the topic too in case the table re-sorted.
+    let row = page.locator(`table tbody tr[data-row-key="${index}"]`);
+    if (rec.topic && !(await row.filter({ hasText: rec.topic }).count())) {
+      row = page.locator("table tbody tr", { hasText: rec.topic }).first();
+    }
+    const fileResponse = page.waitForResponse((r) => /\/lti\/rich\/recording\/file\?/.test(r.url()) && r.ok(), { timeout: 60000 });
+    await row.locator("[role=button], a").first().click({ timeout: 30000 });
+    const body = await (await fileResponse).json();
+    return (body?.result?.recordingFiles ?? []) as ZoomApiFile[];
+  }
+
+  /** Opens the Zoom web player for `playUrl` and returns the signed media URL it streams. */
+  private async resolveZoomMediaUrl(context: BrowserContext, playUrl: string, fileType: ZoomFileType): Promise<string> {
+    const player = await context.newPage();
+    try {
+      const media = player.waitForRequest((r) => /ssrweb\.zoom\.us\//.test(r.url()) && new RegExp(`\\.${fileType}(\\?|$)`, "i").test(r.url()), {
+        timeout: 60000,
+      });
+      await player.goto(playUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+      return (await media).url();
+    } finally {
+      await player.close().catch(() => {});
+    }
+  }
+
+  /** Streams `url` to `file` using the browser context's cookies; writes to a temp file and renames on success. */
+  private async streamWithCookies(context: BrowserContext, url: string, file: string): Promise<number> {
+    const cookie = (await context.cookies(url)).map((c) => `${c.name}=${c.value}`).join("; ");
+    const res = await fetch(url, { headers: { Cookie: cookie, Referer: "https://zoom.us/" } });
+    if (!res.ok || !res.body) throw new Error(`Media download failed: HTTP ${res.status}`);
+    const tmp = `${file}.part`;
+    try {
+      await pipeline(Readable.fromWeb(res.body as any), createWriteStream(tmp));
+      renameSync(tmp, file);
+    } catch (e) {
+      rmSync(tmp, { force: true });
+      throw e;
+    }
+    return statSync(file).size;
   }
 
   async announcements(courseId: string, limit = 25): Promise<Announcement[]> {
@@ -573,4 +628,71 @@ export class BlackboardSession {
     await this.cancelLogin();
     await this.resetApi();
   }
+}
+
+export type ZoomFileType = "mp4" | "m4a";
+
+/** Narrows `download_zoom_recordings` to some recordings. Every field given must match. */
+export interface ZoomRecordingFilter {
+  /** Zoom meeting ID; spaces and dashes are ignored ("813 0790 0208" = "81307900208"). */
+  meetingId?: string;
+  /** Case-insensitive substring of the recording topic. */
+  topic?: string;
+  /** Local start date of the recording, YYYY-MM-DD. */
+  date?: string;
+}
+
+export interface ZoomDownloadResult {
+  topic?: string;
+  meetingId?: string;
+  date?: string;
+  startTime?: string;
+  file?: string;
+  bytes?: number;
+  skipped?: string;
+  error?: string;
+}
+
+/** One entry of the Zoom LTI `recording/COURSE` JSON list. */
+interface ZoomApiRecording {
+  meetingId: string;
+  meetingNumber?: string;
+  topic?: string;
+  /** UTC, "YYYY-MM-DD HH:mm:ss". */
+  startTime?: string;
+  listStartTime?: string;
+  timezone?: string;
+}
+
+/** One entry of the Zoom LTI `recording/file` JSON `recordingFiles`. */
+interface ZoomApiFile {
+  fileType?: string;
+  fileSize?: number;
+  playUrl?: string;
+}
+
+/** Local start date (YYYY-MM-DD) of a recording, in its own timezone. */
+export function zoomLocalDate(rec: { startTime?: string; timezone?: string }): string | undefined {
+  if (!rec.startTime) return undefined;
+  const utc = new Date(`${rec.startTime.replace(" ", "T")}Z`);
+  if (Number.isNaN(utc.getTime())) return rec.startTime.slice(0, 10);
+  try {
+    return new Intl.DateTimeFormat("en-CA", { timeZone: rec.timezone || undefined, year: "numeric", month: "2-digit", day: "2-digit" }).format(utc);
+  } catch {
+    return utc.toISOString().slice(0, 10);
+  }
+}
+
+export function matchesZoomFilter(rec: { meetingNumber?: string; topic?: string; startTime?: string; timezone?: string }, filter?: ZoomRecordingFilter): boolean {
+  if (!filter) return true;
+  if (filter.meetingId && (rec.meetingNumber ?? "").replace(/\D/g, "") !== filter.meetingId.replace(/\D/g, "")) return false;
+  if (filter.topic && !(rec.topic ?? "").toLowerCase().includes(filter.topic.toLowerCase())) return false;
+  if (filter.date && zoomLocalDate(rec) !== filter.date) return false;
+  return true;
+}
+
+function zoomResultBase(rec: ZoomApiRecording): ZoomDownloadResult {
+  const n = (rec.meetingNumber ?? "").replace(/\D/g, "");
+  const meetingId = n.length === 11 ? `${n.slice(0, 3)} ${n.slice(3, 7)} ${n.slice(7)}` : rec.meetingNumber;
+  return { topic: rec.topic, meetingId, date: zoomLocalDate(rec), startTime: rec.listStartTime ?? rec.startTime };
 }
