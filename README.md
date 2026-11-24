@@ -1,6 +1,10 @@
 # Blackboard MCP (Universidad de Palermo)
 
-An MCP server that gives an agent eyes on the user's Blackboard Ultra campus: current-semester courses, open homework, what the professors just uploaded, announcements, and file downloads.
+An MCP server that gives an AI agent eyes on the user's Blackboard Ultra campus: current-semester courses, open homework, what the professors just uploaded, announcements, file downloads, and course messaging.
+
+Developed by **Diego Aguirre (Voftec)**.
+
+Works with any MCP client that speaks stdio - **Devin, Cursor, Codex, Claude Code**, and others. It is not tied to any specific agent.
 
 It works the way a student does - through a normal browser login - so no institutional API keys are needed:
 
@@ -51,13 +55,15 @@ npm install
 npm run build
 ```
 
-Register with Devin (already done on this machine, user scope):
+### Register it in your MCP client
 
-```bash
-devin mcp add -s user blackboard -- node "/Users/die/Universida De Palermo - 2026/BLACKBOARD-mcp/dist/index.js"
-```
+Any client that supports stdio MCP servers can run it. Point the client at `node /path/to/BLACKBOARD-mcp/dist/index.js`:
 
-Then in any Devin session: "log me in to Blackboard" -> sign in in the Chrome window -> "what homework do I have this week?".
+- **Devin**: `devin mcp add -s user blackboard -- node "/path/to/BLACKBOARD-mcp/dist/index.js"` (or add it under Customize > MCPs).
+- **Claude Code**: `claude mcp add blackboard -- node /path/to/BLACKBOARD-mcp/dist/index.js`
+- **Cursor / Codex**: add a stdio server with command `node` and arg `/path/to/BLACKBOARD-mcp/dist/index.js` in the MCP settings.
+
+Then: "log me in to Blackboard" -> sign in in the Chrome window -> "what homework do I have this week?".
 
 ### Smoke test
 

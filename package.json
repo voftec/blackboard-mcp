@@ -1,6 +1,6 @@
 {
   "name": "blackboard-mcp",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "MCP server for Universidad de Palermo's Blackboard Ultra: current courses, homework, new content and file downloads through the student's own browser session",
   "type": "module",
   "main": "dist/index.js",
@@ -18,8 +18,8 @@
     "learn",
     "devin"
   ],
-  "author": "",
-  "license": "MIT",
+  "author": "Diego Aguirre (Voftec)",
+  "license": "Apache-2.0",
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.30.0",
     "jszip": "3.10.1",
