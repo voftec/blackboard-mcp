@@ -38,7 +38,7 @@ When the session expires, tools return `Not logged in...` and Devin should call 
 | `send_message` | Sends a course message as the signed-in user: pass `conversationId` to reply to a thread, or `recipientIds` to start a new conversation. Always confirm recipient + text with the user first. |
 | `get_calendar` | Calendar items across all courses between two dates (default: today → +30 days). |
 | `list_zoom_recordings` | Finds the "Zoom - Clases sincrónicas" LTI tool in each course and lists its Cloud Recordings. `courseId` optional - omit it to search every current course. |
-| `download_zoom_recordings` | Downloads every Zoom Cloud Recording (mp4) into `~/Downloads/Blackboard/<course>/Zoom/`. `courseId` and `destDir` optional. |
+| `download_zoom_recordings` | Downloads Zoom Cloud Recordings one at a time into `~/Downloads/Blackboard/<course>/Zoom/` as `<YYYY-MM-DD> <topic>.mp4`, even when the host disabled the download button. Narrow it to one recording with `meetingId` (e.g. `"813 0790 0208"`), `topic` (substring) and/or `date` (`YYYY-MM-DD`); all given filters must match. `fileType: "m4a"` gets the audio-only file instead of the video. Files already downloaded with the same size are skipped. `courseId` and `destDir` optional. |
 | `get_announcements` | Course announcements as plain text. |
 | `get_activity_stream` | The "Actividad" feed: content added, tests/assignments available or due, grades posted, messages. |
 

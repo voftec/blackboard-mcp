@@ -642,22 +642,37 @@ server.registerTool(
   {
     title: "Download Zoom class recordings",
     description:
-      "Opens each course's Zoom LTI 'Clases sincrónicas', goes to Cloud Recordings and downloads every recording (mp4) into ~/Downloads/Blackboard/<course>/Zoom/. Pass `courseId` for one course; omit it to download from every current course.",
+      "Opens each course's Zoom LTI 'Clases sincrónicas', goes to Cloud Recordings and downloads the recordings one at a time into ~/Downloads/Blackboard/<course>/Zoom/ as '<YYYY-MM-DD> <topic>.mp4'. Works even when the host disabled the download button (it fetches the stream the Zoom web player plays). Pass `courseId` for one course; omit it to download from every current course. Narrow it to a single recording with `meetingId`, `topic` and/or `date` (all given filters must match; see list_zoom_recordings). Recordings already downloaded with the same size are skipped. Full class videos are large (around 1 GB per 2 hours); use fileType 'm4a' for the much smaller audio-only file.",
     inputSchema: {
       courseId: z.string().optional(),
+      meetingId: z.string().optional().describe("Zoom meeting ID, as list_zoom_recordings shows it; spaces are ignored (e.g. '813 0790 0208')."),
+      topic: z.string().optional().describe("Case-insensitive substring of the recording topic."),
+      date: z
+        .string()
+        .regex(/^\d{4}-\d{2}-\d{2}$/)
+        .optional()
+        .describe("Local start date of the recording, YYYY-MM-DD."),
+      fileType: z.enum(["mp4", "m4a"]).optional().describe("'mp4' video (default) or 'm4a' audio only."),
       destDir: z.string().optional().describe("Override the download folder."),
     },
   },
-  tool(async ({ courseId, destDir }) => {
+  tool(async ({ courseId, meetingId, topic, date, fileType, destDir }) => {
     const targets = await zoomTargets(courseId);
     if (!targets.length) return { downloaded: 0, note: "No Zoom LTI tool found in the selected courses.", results: [] };
+    const filter = meetingId || topic || date ? { meetingId, topic, date } : undefined;
     const results: Array<Record<string, unknown>> = [];
     for (const t of targets) {
       const dir = destDir ?? join(DOWNLOAD_DIR, t.courseId, "Zoom");
-      const recs = await bb.downloadZoomRecordings(t.launchUrl, dir).catch((e) => [{ error: String(e) }]);
+      const recs = await bb.downloadZoomRecordings(t.launchUrl, dir, { filter, fileType }).catch((e) => [{ error: String(e) }]);
       for (const r of recs as any[]) results.push({ courseId: t.courseId, course: t.courseName, ...r });
     }
-    return { downloaded: results.filter((r) => r.file).length, skipped: results.filter((r) => r.skipped || r.error).length, results };
+    const out: Record<string, unknown> = {
+      downloaded: results.filter((r) => r.file && !r.skipped).length,
+      skipped: results.filter((r) => r.skipped || r.error).length,
+      results,
+    };
+    if (filter && !results.length) out.note = "No recording matched the given meetingId/topic/date.";
+    return out;
   })
 );
 
