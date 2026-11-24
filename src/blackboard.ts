@@ -427,6 +427,133 @@ export class BlackboardSession {
     );
   }
 
+  /** Finds the Zoom LTI launch link in a course ("Zoom - Clases sincrónicas" or any BLTI tool whose title/URL mentions zoom). */
+  async findZoomLaunchUrl(courseId: string): Promise<{ contentId: string; title: string; launchUrl: string } | undefined> {
+    const items = await this.getAll<ContentItem>(
+      `${API}/courses/${encodeURIComponent(courseId)}/contents?@view=Summary&expand=gradebookCategory&limit=200`
+    );
+    const candidates: ContentItem[] = [...items];
+    // One level of folders is enough for the standard "Clases sincrónicas (videoconferencias)" layout.
+    for (const item of items) {
+      const handler = item.contentHandler ?? "";
+      if (handler === "resource/x-bb-folder" || handler === "resource/x-bb-lesson") {
+        candidates.push(...(await this.contentChildren(courseId, item.id)));
+      }
+    }
+    for (const item of candidates) {
+      const handler = item.contentHandler ?? "";
+      const detail = item.contentDetail?.[handler];
+      const launchLink: string | undefined = detail?.launchLink;
+      const isZoomTool =
+        (handler.startsWith("resource/x-bb-bltiplacement-") || handler === "resource/x-bb-blti-link") &&
+        (/zoom/i.test(item.title ?? "") || /zoom/i.test(launchLink ?? "") || /zoom/i.test(item.description ?? ""));
+      if (isZoomTool && launchLink) {
+        return { contentId: item.id, title: item.title ?? "Zoom", launchUrl: `${BASE_URL}${launchLink}` };
+      }
+    }
+    return undefined;
+  }
+
+  /** Opens the course's Zoom LTI in a headless browser and returns the Cloud Recordings list. */
+  async zoomRecordings(launchUrl: string): Promise<Array<{ topic: string; meetingId?: string; startTime?: string; detailUrl?: string }>> {
+    const { page, browser } = await this.zoomRecordingsPage(launchUrl);
+    try {
+      const rows = await page.$$eval("table tbody tr, tr[class*='record'], [class*='recording'] tr", (trs) =>
+        trs
+          .map((tr) => {
+            const cells = Array.from(tr.querySelectorAll("td")).map((td) => (td as any).innerText.trim());
+            const a = tr.querySelector("a[href]") as any;
+            if (!cells.length && !a) return null;
+            return { topic: cells[0] ?? a?.innerText?.trim() ?? "", meetingId: cells[1], startTime: cells[2], detailUrl: a?.href };
+          })
+          .filter(Boolean)
+      );
+      return rows as Array<{ topic: string; meetingId?: string; startTime?: string; detailUrl?: string }>;
+    } finally {
+      await browser.close();
+    }
+  }
+
+  /** Opens the course's Zoom LTI in a headless browser, goes to Cloud Recordings and downloads each recording into `destDir`. */
+  async downloadZoomRecordings(launchUrl: string, destDir: string): Promise<Array<{ topic: string; file?: string; skipped?: string }>> {
+    const { page, context, browser } = await this.zoomRecordingsPage(launchUrl);
+    mkdirSync(destDir, { recursive: true });
+    const results: Array<{ topic: string; file?: string; skipped?: string }> = [];
+    try {
+      const rowHandles = await page.$$("table tbody tr");
+      for (let i = 0; i < rowHandles.length; i++) {
+        const tr = rowHandles[i];
+        const topic = ((await tr.$eval("td", (td) => (td as any).innerText).catch(() => "")) || `recording-${i}`).trim();
+        const safe = topic.replace(/[\\/:*?"<>|]+/g, "_").slice(0, 120);
+        // Try a download control inside the row first; otherwise open the recording detail page.
+        let downloadEl = await tr.$("a[href*='download'], button:has-text('Download'), [title*='ownload' i], [aria-label*='ownload' i]");
+        if (!downloadEl) {
+          const link = await tr.$("a[href]");
+          if (link) {
+            await link.click();
+            await page.waitForLoadState("domcontentloaded").catch(() => {});
+            await page.waitForTimeout(1500);
+            downloadEl = await page.$("a[href*='download'], button:has-text('Download'), [title*='ownload' i], [aria-label*='ownload' i]");
+          }
+        }
+        if (!downloadEl) {
+          results.push({ topic, skipped: "no download control found" });
+          await page.goBack().catch(() => {});
+          continue;
+        }
+        // Prefer intercepting the browser download event (covers both direct links and JS triggers).
+        const [download] = await Promise.all([
+          page.waitForEvent("download", { timeout: 30000 }).catch(() => null),
+          downloadEl.click().catch(() => null),
+        ]);
+        if (download) {
+          const name = `${safe}.mp4`;
+          await download.saveAs(join(destDir, name));
+          results.push({ topic, file: join(destDir, name) });
+        } else {
+          const href = await downloadEl.getAttribute("href");
+          if (href) {
+            const abs = new URL(href, page.url()).href;
+            const file = await this.downloadTo(destDir, abs, `${safe}.mp4`);
+            results.push({ topic, file });
+          } else {
+            results.push({ topic, skipped: "download triggered nothing" });
+          }
+        }
+        await page.goBack().catch(() => {});
+      }
+      return results;
+    } finally {
+      await context.close().catch(() => {});
+      await browser.close().catch(() => {});
+    }
+  }
+
+  /** Launches the Zoom LTI inside the saved session and lands on the Cloud Recordings tab. */
+  private async zoomRecordingsPage(launchUrl: string) {
+    if (!existsSync(STATE_FILE)) throw new NotLoggedInError();
+    const browser = await chromium.launch({ channel: BROWSER_CHANNEL, headless: true });
+    const context = await browser.newContext({ storageState: STATE_FILE });
+    const page = await context.newPage();
+    await page.goto(launchUrl, { waitUntil: "domcontentloaded", timeout: 60000 });
+    // LTI redirects through applications.zoom.us; give it time, then click the Cloud Recordings tab.
+    await page.waitForURL(/zoom\.us|zoom\.com/, { timeout: 60000 }).catch(() => {});
+    const tab = page.locator("text=/cloud recordings/i").first();
+    await tab.waitFor({ timeout: 30000 }).catch(() => {});
+    await tab.click().catch(() => {});
+    await page.waitForTimeout(2500);
+    return { page, context, browser };
+  }
+
+  private async downloadTo(destDir: string, url: string, fileName: string): Promise<string> {
+    const resp = await this.api!.get(url);
+    if (!resp.ok()) throw new Error(`Download failed: HTTP ${resp.status()}`);
+    const file = join(destDir, fileName);
+    const { writeFile } = await import("node:fs/promises");
+    await writeFile(file, Buffer.from(await resp.body()));
+    return file;
+  }
+
   async announcements(courseId: string, limit = 25): Promise<Announcement[]> {
     const page = await this.get<Paged<Announcement>>(`${API}/courses/${encodeURIComponent(courseId)}/announcements?limit=${limit}`);
     return page.results ?? [];

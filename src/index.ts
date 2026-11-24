@@ -605,6 +605,62 @@ server.registerTool(
   })
 );
 
+/** Every current course (or just `courseId`) that has a Zoom LTI tool, with its launch URL. */
+async function zoomTargets(courseId?: string): Promise<Array<{ courseId: string; courseName?: string; title: string; launchUrl: string }>> {
+  const courses = await listCourses(bb, new Date(), true);
+  const ids = courseId ? [courseId] : courses.map((c) => c.id);
+  const out: Array<{ courseId: string; courseName?: string; title: string; launchUrl: string }> = [];
+  for (const id of ids) {
+    const found = await bb.findZoomLaunchUrl(id).catch(() => undefined);
+    if (found) out.push({ courseId: id, courseName: courses.find((c) => c.id === id)?.name, ...found });
+  }
+  return out;
+}
+
+server.registerTool(
+  "list_zoom_recordings",
+  {
+    title: "List Zoom class recordings",
+    description:
+      "Finds each course's 'Zoom - Clases sincrónicas' LTI tool, opens it, and lists the Cloud Recordings (recorded synchronous classes). Pass `courseId` for one course; omit it to search every current course.",
+    inputSchema: { courseId: z.string().optional() },
+  },
+  tool(async ({ courseId }) => {
+    const targets = await zoomTargets(courseId);
+    if (!targets.length) return { count: 0, note: "No Zoom LTI tool found in the selected courses.", recordings: [] };
+    const recordings: Array<Record<string, unknown>> = [];
+    for (const t of targets) {
+      const recs = await bb.zoomRecordings(t.launchUrl).catch((e) => [{ error: String(e) }]);
+      for (const r of recs as any[]) recordings.push({ courseId: t.courseId, course: t.courseName, tool: t.title, ...r });
+    }
+    return { count: recordings.length, coursesSearched: targets.length, recordings };
+  })
+);
+
+server.registerTool(
+  "download_zoom_recordings",
+  {
+    title: "Download Zoom class recordings",
+    description:
+      "Opens each course's Zoom LTI 'Clases sincrónicas', goes to Cloud Recordings and downloads every recording (mp4) into ~/Downloads/Blackboard/<course>/Zoom/. Pass `courseId` for one course; omit it to download from every current course.",
+    inputSchema: {
+      courseId: z.string().optional(),
+      destDir: z.string().optional().describe("Override the download folder."),
+    },
+  },
+  tool(async ({ courseId, destDir }) => {
+    const targets = await zoomTargets(courseId);
+    if (!targets.length) return { downloaded: 0, note: "No Zoom LTI tool found in the selected courses.", results: [] };
+    const results: Array<Record<string, unknown>> = [];
+    for (const t of targets) {
+      const dir = destDir ?? join(DOWNLOAD_DIR, t.courseId, "Zoom");
+      const recs = await bb.downloadZoomRecordings(t.launchUrl, dir).catch((e) => [{ error: String(e) }]);
+      for (const r of recs as any[]) results.push({ courseId: t.courseId, course: t.courseName, ...r });
+    }
+    return { downloaded: results.filter((r) => r.file).length, skipped: results.filter((r) => r.skipped || r.error).length, results };
+  })
+);
+
 server.registerTool(
   "get_activity_stream",
   {
