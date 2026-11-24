@@ -105,3 +105,7 @@ Ultra "documents" are folders with `isBbPage: true` whose child `ultraDocumentBo
 ## Disclaimer
 
 Personal project, not affiliated with or endorsed by Anthology/Blackboard or Universidad de Palermo. It uses the institution's own web API with the signed-in user's session; users are responsible for complying with their institution's terms of use.
+
+## License
+
+Voftec License - Copyright (c) 2026 Diego Aguirre (Voftec). You may download, use, and modify it for personal, non-commercial purposes. Selling it or distributing modified versions is prohibited. See [LICENSE](LICENSE).
