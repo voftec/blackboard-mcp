@@ -1,0 +1,34 @@
+{
+  "name": "blackboard-mcp",
+  "version": "2.0.0",
+  "description": "MCP server for Universidad de Palermo's Blackboard Ultra: current courses, homework, new content and file downloads through the student's own browser session",
+  "type": "module",
+  "main": "dist/index.js",
+  "bin": {
+    "blackboard-mcp": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "keywords": [
+    "mcp",
+    "blackboard",
+    "learn",
+    "devin"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "jszip": "3.10.1",
+    "playwright": "1.62.1",
+    "unpdf": "1.8.1",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "@types/node": "20.17.0",
+    "typescript": "5.7.2"
+  }
+}
